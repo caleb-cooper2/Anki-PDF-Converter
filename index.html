@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PDF to Anki Converter</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Questrial&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<nav class="navbar">
+    <div>
+        <span class="name">Caleb Cooper</span>
+        <span class="job-title">Software Engineer</span>
+    </div>
+</nav>
+
+<div class="container">
+    <div class="header">
+        <h1>PDF to Anki Converter</h1>
+        <p>Turn your lecture slides into flashcards</p>
+    </div>
+
+    <div class="content">
+        <div class="page-limit-warning" id="pageLimitWarning">
+            PDFs with more than 100 pages may take a long time to process. Consider splitting large PDFs.
+        </div>
+
+        <div class="upload-area" id="uploadArea">
+            <div class="upload-icon">📄</div>
+            <div class="upload-text">Drag & Drop your PDF here</div>
+            <div class="upload-hint">or click to browse</div>
+            <input type="file" id="fileInput" accept=".pdf">
+        </div>
+
+        <div class="file-info" id="fileInfo">
+            <div class="file-info-item">
+                <span class="file-info-label">File:</span>
+                <span id="fileName">-</span>
+            </div>
+            <div class="file-info-item">
+                <span class="file-info-label">Size:</span>
+                <span id="fileSize">-</span>
+            </div>
+            <div class="file-info-item">
+                <span class="file-info-label">Pages:</span>
+                <span id="filePages">-</span>
+            </div>
+        </div>
+
+        <div class="parameters">
+            <h2>Parameters</h2>
+
+            <div class="param-group">
+                <label class="param-label" for="deckName">Deck Name</label>
+                <input type="text" id="deckName" value="Lecture Flashcards" placeholder="My Deck">
+                <div class="param-hint">Name for your Anki deck</div>
+            </div>
+
+            <div class="param-group">
+                <label class="param-label" for="maxCards">Max Cards</label>
+                <input type="number" id="maxCards" value="300" min="1" max="1000">
+                <div class="param-hint">Maximum total number of flashcards to generate</div>
+            </div>
+
+            <div class="param-group">
+                <label class="param-label" for="maxPerSlide">Max Cards Per Slide</label>
+                <input type="number" id="maxPerSlide" value="3" min="1" max="10">
+                <div class="param-hint">Maximum cards to generate from each slide</div>
+            </div>
+
+            <div class="param-group">
+                <label class="param-label" for="model">OpenAI Model</label>
+                <select id="model">
+                    <option value="gpt-5-nano">GPT-5 Nano (Recommended)</option>
+                    <option value="gpt-5-mini">GPT-5 Mini</option>
+                    <option value="gpt-4-nano">GPT-4 Nano</option>
+                    <option value="gpt-4-mini">GPT-4 Mini</option>
+                </select>
+                <div class="param-hint">AI model to use for card generation</div>
+            </div>
+
+            <div class="param-group">
+                <label class="param-label" for="startPage">Start Page</label>
+                <input type="number" id="startPage" value="1" min="1">
+                <div class="param-hint">First page to process (1-based)</div>
+            </div>
+
+            <div class="param-group">
+                <label class="param-label" for="endPage">End Page</label>
+                <input type="number" id="endPage" value="" min="1" placeholder="All pages">
+                <div class="param-hint">Last page to process (leave empty for all pages)</div>
+            </div>
+
+            <div class="param-group">
+                <div class="checkbox-group">
+                    <input type="checkbox" id="skipEmpty" checked>
+                    <label class="param-label" for="skipEmpty">Skip Empty Slides</label>
+                </div>
+                <div class="param-hint">Skip slides with no extractable text</div>
+            </div>
+
+            <div class="param-group">
+                <div class="checkbox-group">
+                    <input type="checkbox" id="generateApkg" checked>
+                    <label class="param-label" for="generateApkg">Generate Anki Package (.apkg)</label>
+                </div>
+                <div class="param-hint">Create an Anki deck file you can import directly</div>
+            </div>
+        </div>
+
+        <button class="btn" id="processBtn" disabled>Generate Flashcards</button>
+
+        <div class="error-message" id="errorMessage"></div>
+        <div class="success-message" id="successMessage"></div>
+
+        <div class="progress-container" id="progressContainer">
+            <div class="progress-info">
+                <span class="progress-status" id="progressStatus">Processing...</span>
+                <span id="progressText">0%</span>
+            </div>
+            <div class="progress-bar-wrapper">
+                <div class="progress-bar" id="progressBar">0%</div>
+            </div>
+            <div class="progress-info">
+                <span>Page <span id="currentPage">0</span> of <span id="totalPages">0</span></span>
+                <span><span id="cardsGenerated">0</span> cards generated</span>
+            </div>
+        </div>
+
+        <div class="download-buttons" id="downloadButtons">
+            <button class="btn btn-download" id="downloadCsv">Download CSV</button>
+            <button class="btn btn-download" id="downloadApkg">Download Anki Deck</button>
+        </div>
+    </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+    if (typeof pdfjsLib !== 'undefined') {
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    }
+
+    const uploadArea = document.getElementById('uploadArea');
+    const fileInput = document.getElementById('fileInput');
+    const fileInfo = document.getElementById('fileInfo');
+    const fileName = document.getElementById('fileName');
+    const fileSize = document.getElementById('fileSize');
+    const filePages = document.getElementById('filePages');
+    const processBtn = document.getElementById('processBtn');
+    const progressContainer = document.getElementById('progressContainer');
+    const progressBar = document.getElementById('progressBar');
+    const progressText = document.getElementById('progressText');
+    const progressStatus = document.getElementById('progressStatus');
+    const currentPage = document.getElementById('currentPage');
+    const totalPages = document.getElementById('totalPages');
+    const cardsGenerated = document.getElementById('cardsGenerated');
+    const errorMessage = document.getElementById('errorMessage');
+    const successMessage = document.getElementById('successMessage');
+    const downloadButtons = document.getElementById('downloadButtons');
+    const downloadCsv = document.getElementById('downloadCsv');
+    const downloadApkg = document.getElementById('downloadApkg');
+    const pageLimitWarning = document.getElementById('pageLimitWarning');
+
+    let currentJobId = null;
+    let currentFile = null;
+    let progressInterval = null;
+
+    uploadArea.addEventListener('click', () => fileInput.click());
+    uploadArea.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        uploadArea.classList.add('dragover');
+    });
+    uploadArea.addEventListener('dragleave', () => {
+        uploadArea.classList.remove('dragover');
+    });
+    uploadArea.addEventListener('drop', (e) => {
+        e.preventDefault();
+        uploadArea.classList.remove('dragover');
+        const files = e.dataTransfer.files;
+        if (files.length > 0) {
+            handleFile(files[0]);
+        }
+    });
+
+    fileInput.addEventListener('change', (e) => {
+        if (e.target.files.length > 0) {
+            handleFile(e.target.files[0]);
+        }
+    });
+
+    function handleFile(file) {
+        if (!file.type.includes('pdf')) {
+            showError('Please select a PDF file.');
+            return;
+        }
+
+        currentFile = file;
+        fileName.textContent = file.name;
+        fileSize.textContent = formatFileSize(file.size);
+        fileInfo.classList.add('show');
+
+        if (file.size > 50 * 1024 * 1024) {
+            showError('File size exceeds 50MB limit.');
+            return;
+        }
+
+        const reader = new FileReader();
+        reader.onload = async (e) => {
+            try {
+                const arrayBuffer = e.target.result;
+                const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+                const pageCount = pdf.numPages;
+                filePages.textContent = pageCount;
+
+                if (pageCount > 100) {
+                    pageLimitWarning.classList.add('show');
+                } else {
+                    pageLimitWarning.classList.remove('show');
+                }
+
+                const endPageInput = document.getElementById('endPage');
+                if (!endPageInput.value) {
+                    endPageInput.value = pageCount;
+                }
+
+                processBtn.disabled = false;
+            } catch (err) {
+                console.error('Error reading PDF:', err);
+                showError('Error reading PDF file. Please ensure it is a valid PDF.');
+            }
+        };
+        reader.readAsArrayBuffer(file);
+    }
+
+    function formatFileSize(bytes) {
+        if (bytes < 1024) return bytes + ' B';
+        if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(2) + ' KB';
+        return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+    }
+
+    processBtn.addEventListener('click', async () => {
+        if (!currentFile) {
+            showError('Please select a PDF file first.');
+            return;
+        }
+
+        errorMessage.classList.remove('show');
+        successMessage.classList.remove('show');
+        downloadButtons.classList.remove('show');
+
+        const formData = new FormData();
+        formData.append('file', currentFile);
+        formData.append('deck_name', document.getElementById('deckName').value);
+        formData.append('max_cards', document.getElementById('maxCards').value);
+        formData.append('max_per_slide', document.getElementById('maxPerSlide').value);
+        formData.append('model', document.getElementById('model').value);
+        formData.append('start_page', document.getElementById('startPage').value);
+        formData.append('end_page', document.getElementById('endPage').value || '');
+        formData.append('skip_empty', document.getElementById('skipEmpty').checked);
+        formData.append('generate_apkg', document.getElementById('generateApkg').checked);
+
+        try {
+            processBtn.disabled = true;
+            progressContainer.classList.add('show');
+            progressBar.style.width = '0%';
+            progressText.textContent = '0%';
+            progressStatus.textContent = 'Uploading...';
+
+            const response = await fetch('/api/upload', {
+                method: 'POST',
+                body: formData
+            });
+
+            const data = await response.json();
+
+            if (!response.ok) {
+                throw new Error(data.error || 'Upload failed');
+            }
+
+            currentJobId = data.job_id;
+            totalPages.textContent = data.page_count;
+            progressStatus.textContent = 'Processing...';
+
+            startProgressPolling();
+
+        } catch (error) {
+            showError(error.message);
+            processBtn.disabled = false;
+            progressContainer.classList.remove('show');
+        }
+    });
+
+    function startProgressPolling() {
+        if (progressInterval) {
+            clearInterval(progressInterval);
+        }
+
+        progressInterval = setInterval(async () => {
+            try {
+                const response = await fetch(`/api/progress/${currentJobId}`);
+                const data = await response.json();
+
+                if (data.status === 'processing') {
+                    const progress = data.progress || 0;
+                    progressBar.style.width = progress + '%';
+                    progressText.textContent = progress + '%';
+                    progressBar.textContent = progress + '%';
+                    currentPage.textContent = data.current_page || 0;
+                    totalPages.textContent = data.total_pages || 0;
+                    cardsGenerated.textContent = data.cards_generated || 0;
+                    progressStatus.textContent = 'Processing...';
+                } else if (data.status === 'completed') {
+                    clearInterval(progressInterval);
+                    progressBar.style.width = '100%';
+                    progressText.textContent = '100%';
+                    progressBar.textContent = '100%';
+                    progressStatus.textContent = 'Completed!';
+                    currentPage.textContent = data.total_pages;
+                    cardsGenerated.textContent = data.cards_generated;
+                    showSuccess(`Successfully generated ${data.cards_generated} flashcards!`);
+                    downloadButtons.classList.add('show');
+                    processBtn.disabled = false;
+                } else if (data.status === 'error') {
+                    clearInterval(progressInterval);
+                    showError(data.error || 'An error occurred during processing');
+                    processBtn.disabled = false;
+                    progressContainer.classList.remove('show');
+                }
+            } catch (error) {
+                console.error('Error polling progress:', error);
+            }
+        }, 1000);
+    }
+
+    function showError(message) {
+        errorMessage.textContent = message;
+        errorMessage.classList.add('show');
+        successMessage.classList.remove('show');
+    }
+
+    function showSuccess(message) {
+        successMessage.textContent = message;
+        successMessage.classList.add('show');
+        errorMessage.classList.remove('show');
+    }
+
+    downloadCsv.addEventListener('click', () => {
+        if (currentJobId) {
+            window.location.href = `/api/download/${currentJobId}?type=csv`;
+        }
+    });
+
+    downloadApkg.addEventListener('click', () => {
+        if (currentJobId) {
+            window.location.href = `/api/download/${currentJobId}?type=apkg`;
+        }
+    });
+</script>
+</body>
+</html>
+
