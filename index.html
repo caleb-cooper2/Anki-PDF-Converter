@@ -117,8 +117,6 @@
                 <select id="model">
                     <option value="gpt-5-nano">GPT-5 Nano (Recommended)</option>
                     <option value="gpt-5-mini">GPT-5 Mini</option>
-                    <option value="gpt-4-nano">GPT-4 Nano</option>
-                    <option value="gpt-4-mini">GPT-4 Mini</option>
                 </select>
                 <div class="param-hint">AI model to use for card generation</div>
             </div>
@@ -172,8 +170,8 @@
         </div>
 
         <div class="download-buttons" id="downloadButtons">
-            <button class="btn btn-download" id="downloadCsv">Download CSV</button>
-            <button class="btn btn-download" id="downloadApkg">Download Anki Deck</button>
+            <button class="btn" id="downloadCsv">Download CSV</button>
+            <button class="btn" id="downloadApkg">Download Anki Deck</button>
         </div>
     </div>
 </div>
@@ -339,9 +337,19 @@
             clearInterval(progressInterval);
         }
 
+        // Capture the job_id for this polling session so it's stable
+        const pollingJobId = currentJobId;
+
         progressInterval = setInterval(async () => {
             try {
-                const response = await fetch(`/api/progress/${currentJobId}`);
+                const response = await fetch(`/api/progress/${pollingJobId}`);
+
+                if (!response.ok) {
+                    // Ignore transient errors (e.g. brief 404 during startup)
+                    console.warn('Progress poll returned', response.status);
+                    return;
+                }
+
                 const data = await response.json();
 
                 if (data.status === 'processing') {
@@ -355,6 +363,7 @@
                     progressStatus.textContent = 'Processing...';
                 } else if (data.status === 'completed') {
                     clearInterval(progressInterval);
+                    progressInterval = null;
                     progressBar.style.width = '100%';
                     progressText.textContent = '100%';
                     progressBar.textContent = '100%';
@@ -362,10 +371,15 @@
                     currentPage.textContent = data.total_pages;
                     cardsGenerated.textContent = data.cards_generated;
                     showSuccess(`Successfully generated ${data.cards_generated} flashcards!`);
+
+                    // Bind download buttons to THIS job's ID so a future job can't overwrite them
+                    downloadCsv.dataset.jobId = pollingJobId;
+                    downloadApkg.dataset.jobId = pollingJobId;
                     downloadButtons.classList.add('show');
                     processBtn.disabled = false;
                 } else if (data.status === 'error') {
                     clearInterval(progressInterval);
+                    progressInterval = null;
                     showError(data.error || 'An error occurred during processing');
                     processBtn.disabled = false;
                     progressContainer.classList.remove('show');
@@ -373,7 +387,7 @@
             } catch (error) {
                 console.error('Error polling progress:', error);
             }
-        }, 1000);
+        }, 2000);
     }
 
     function showError(message) {
@@ -388,16 +402,44 @@
         errorMessage.classList.remove('show');
     }
 
-    downloadCsv.addEventListener('click', () => {
-        if (currentJobId) {
-            window.location.href = `/api/download/${currentJobId}?type=csv`;
+    async function downloadFile(jobId, type) {
+        try {
+            const response = await fetch(`/api/download/${jobId}?type=${type}`, {
+                headers: { 'Accept': 'application/json' }
+            });
+
+            if (!response.ok) {
+                let errorMsg = 'Download failed. Please try generating again.';
+                try {
+                    const data = await response.json();
+                    errorMsg = data.error || errorMsg;
+                } catch {}
+                showError(errorMsg);
+                return;
+            }
+
+            const blob = await response.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = type === 'csv' ? 'flashcards.csv' : 'flashcards.apkg';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        } catch (error) {
+            showError('Failed to download file. Please try again.');
         }
+    }
+
+    downloadCsv.addEventListener('click', () => {
+        const jobId = downloadCsv.dataset.jobId || currentJobId;
+        if (jobId) downloadFile(jobId, 'csv');
     });
 
     downloadApkg.addEventListener('click', () => {
-        if (currentJobId) {
-            window.location.href = `/api/download/${currentJobId}?type=apkg`;
-        }
+        const jobId = downloadApkg.dataset.jobId || currentJobId;
+        if (jobId) downloadFile(jobId, 'apkg');
     });
 </script>
 </body>

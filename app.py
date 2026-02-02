@@ -13,6 +13,7 @@ from typing import List, Dict
 from flask import Flask, request, jsonify, send_file, Response
 from flask_cors import CORS
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pypdf import PdfReader
 from openai import OpenAI
 import genanki
@@ -37,6 +38,24 @@ os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 # Store progress so that progress bar is possible
 progress_store = {}
+progress_lock = threading.Lock()
+
+CONCURRENT_SLIDES = 3  # Number of slides to process in parallel
+
+
+def update_progress(job_id: str, **kwargs):
+    """Thread-safe update of progress store."""
+    with progress_lock:
+        if job_id in progress_store:
+            progress_store[job_id].update(kwargs)
+
+
+def get_progress_snapshot(job_id: str):
+    """Thread-safe read of progress store."""
+    with progress_lock:
+        if job_id in progress_store:
+            return dict(progress_store[job_id])
+        return None
 
 SYSTEM_PROMPT = """You are an expert teaching assistant that writes concise, high-quality flashcards for spaced repetition.
 Target audience: university students preparing for exams.
@@ -149,17 +168,8 @@ def call_openai_for_cards(client, slide_text: str, slide_idx: int, max_per_slide
 
 
 def process_pdf(job_id: str, pdf_path: str, params: dict):
-    """Process PDF in background thread"""
+    """Process PDF in background thread with concurrent slide processing."""
     try:
-        progress_store[job_id] = {
-            'status': 'processing',
-            'progress': 0,
-            'total_pages': 0,
-            'current_page': 0,
-            'cards_generated': 0,
-            'error': None
-        }
-
         if not os.getenv("OPENAI_API_KEY"):
             raise RuntimeError("OPENAI_API_KEY is not set in the environment.")
         
@@ -175,7 +185,7 @@ def process_pdf(job_id: str, pdf_path: str, params: dict):
         if total_pages > MAX_PDF_PAGES:
             raise RuntimeError(f"PDF has {total_pages} pages. Maximum allowed is {MAX_PDF_PAGES} pages.")
 
-        progress_store[job_id]['total_pages'] = total_pages
+        update_progress(job_id, total_pages=total_pages)
 
         cards: List[Dict[str, str]] = []
         global_cap = params.get('max_cards', 300)
@@ -185,6 +195,8 @@ def process_pdf(job_id: str, pdf_path: str, params: dict):
         end_page = params.get('end_page', total_pages)
         skip_empty = params.get('skip_empty', False)
 
+        # Build list of slides to process
+        slides_to_process = []
         for idx0, slide_text in enumerate(pages):
             slide_idx = idx0 + 1
             
@@ -192,31 +204,48 @@ def process_pdf(job_id: str, pdf_path: str, params: dict):
                 continue
             if skip_empty and not slide_text:
                 continue
+            slides_to_process.append((slide_idx, slide_text))
+
+        total_slides = len(slides_to_process)
+        slides_completed = 0
+
+        # Process slides in batches for concurrency while respecting global cap
+        for batch_start in range(0, total_slides, CONCURRENT_SLIDES):
             if len(cards) >= global_cap:
                 break
 
-            progress_store[job_id]['current_page'] = slide_idx
-            progress_store[job_id]['progress'] = int((slide_idx / total_pages) * 100)
+            batch = slides_to_process[batch_start:batch_start + CONCURRENT_SLIDES]
 
-            try:
-                max_for_this_slide = min(max_per_slide, global_cap - len(cards))
-                if max_for_this_slide <= 0:
-                    break
-                proposed = call_openai_for_cards(
-                    client=client,
-                    slide_text=slide_text,
-                    slide_idx=slide_idx,
-                    max_per_slide=max_for_this_slide,
-                    model=model,
-                )
-                if proposed:
-                    space = global_cap - len(cards)
-                    cards.extend(proposed[:space])
-                    progress_store[job_id]['cards_generated'] = len(cards)
-            except Exception as e:
-                print(f"[warn] Slide {slide_idx} failed: {e}")
-                time.sleep(0.5)
-                continue
+            with ThreadPoolExecutor(max_workers=CONCURRENT_SLIDES) as executor:
+                futures = {}
+                for slide_idx, slide_text in batch:
+                    future = executor.submit(
+                        call_openai_for_cards,
+                        client=client,
+                        slide_text=slide_text,
+                        slide_idx=slide_idx,
+                        max_per_slide=max_per_slide,
+                        model=model,
+                    )
+                    futures[future] = slide_idx
+
+                for future in as_completed(futures):
+                    slide_idx = futures[future]
+                    slides_completed += 1
+                    try:
+                        proposed = future.result()
+                        if proposed:
+                            space = global_cap - len(cards)
+                            if space > 0:
+                                cards.extend(proposed[:space])
+                    except Exception as e:
+                        print(f"[warn] Slide {slide_idx} failed: {e}")
+
+                    update_progress(job_id,
+                        current_page=slide_idx,
+                        progress=int((slides_completed / total_slides) * 100),
+                        cards_generated=len(cards),
+                    )
 
         if not cards:
             raise RuntimeError("No cards generated. Check PDF text extraction and try different parameters.")
@@ -236,23 +265,25 @@ def process_pdf(job_id: str, pdf_path: str, params: dict):
             apkg_path = os.path.join(app.config['OUTPUT_FOLDER'], f"{job_id}.apkg")
             build_apkg_from_csv(csv_path, deck_name, apkg_path)
 
-        progress_store[job_id] = {
-            'status': 'completed',
-            'progress': 100,
-            'total_pages': total_pages,
-            'current_page': total_pages,
-            'cards_generated': len(cards),
-            'error': None,
-            'csv_path': csv_path,
-            'apkg_path': apkg_path
-        }
+        with progress_lock:
+            progress_store[job_id] = {
+                'status': 'completed',
+                'progress': 100,
+                'total_pages': total_pages,
+                'current_page': total_pages,
+                'cards_generated': len(cards),
+                'error': None,
+                'csv_path': csv_path,
+                'apkg_path': apkg_path,
+            }
 
     except Exception as e:
-        progress_store[job_id] = {
-            'status': 'error',
-            'error': str(e),
-            'progress': progress_store.get(job_id, {}).get('progress', 0)
-        }
+        with progress_lock:
+            progress_store[job_id] = {
+                'status': 'error',
+                'error': str(e),
+                'progress': progress_store.get(job_id, {}).get('progress', 0),
+            }
 
 
 def build_apkg_from_csv(csv_path: str, deck_name: str, apkg_path: str):
@@ -351,6 +382,17 @@ def upload_file():
             'deck_name': params.get('deck_name', 'Lecture Flashcards')
         }
         
+        # Initialize progress BEFORE starting thread to prevent 404s on early polls
+        with progress_lock:
+            progress_store[job_id] = {
+                'status': 'processing',
+                'progress': 0,
+                'total_pages': page_count,
+                'current_page': 0,
+                'cards_generated': 0,
+                'error': None,
+            }
+
         # Start processing in background
         thread = threading.Thread(target=process_pdf, args=(job_id, final_path, params_dict))
         thread.daemon = True
@@ -370,35 +412,52 @@ def upload_file():
 
 @app.route('/api/progress/<job_id>', methods=['GET'])
 def get_progress(job_id):
-    if job_id not in progress_store:
+    snapshot = get_progress_snapshot(job_id)
+    if snapshot is None:
         return jsonify({'error': 'Job not found'}), 404
-    
-    return jsonify(progress_store[job_id])
+
+    return jsonify(snapshot)
+
+def _download_error(message: str, status_code: int):
+    """Return error as JSON for fetch() requests, or HTML for direct browser navigation."""
+    if request.headers.get('Accept', '').startswith('application/json'):
+        return jsonify({'error': message}), status_code
+    # HTML fallback for direct browser navigation (window.location.href)
+    html = f"""<!DOCTYPE html>
+<html><head><title>Download Error</title>
+<style>body{{font-family:-apple-system,Segoe UI,Roboto,Helvetica,sans-serif;display:flex;
+justify-content:center;align-items:center;min-height:100vh;margin:0;background:#1a1a2e;color:#e0e0e0;}}
+.box{{text-align:center;padding:2rem;border-radius:12px;background:#16213e;max-width:400px;}}
+h2{{color:#e94560;}}a{{color:#0f3460;background:#e0e0e0;padding:8px 20px;border-radius:6px;
+text-decoration:none;display:inline-block;margin-top:1rem;}}</style></head>
+<body><div class="box"><h2>Download Error</h2><p>{message}</p>
+<a href="/">Back to Converter</a></div></body></html>"""
+    return Response(html, status=status_code, content_type='text/html')
 
 
 @app.route('/api/download/<job_id>', methods=['GET'])
 def download_file(job_id):
     file_type = request.args.get('type', 'csv')  # 'csv' or 'apkg'
-    
-    if job_id not in progress_store:
-        return jsonify({'error': 'Job not found'}), 404
-    
-    job = progress_store[job_id]
+
+    job = get_progress_snapshot(job_id)
+    if job is None:
+        return _download_error('Job not found. It may have expired — please generate your flashcards again.', 404)
+
     if job['status'] != 'completed':
-        return jsonify({'error': 'Job not completed yet'}), 400
-    
+        return _download_error('Job has not completed yet. Please wait for processing to finish.', 400)
+
     if file_type == 'csv':
         file_path = job.get('csv_path')
         if not file_path or not os.path.exists(file_path):
-            return jsonify({'error': 'CSV file not found'}), 404
+            return _download_error('CSV file not found. It may have been cleaned up - please generate again.', 404)
         return send_file(file_path, as_attachment=True, download_name=f'cards_{job_id}.csv')
     elif file_type == 'apkg':
         file_path = job.get('apkg_path')
         if not file_path or not os.path.exists(file_path):
-            return jsonify({'error': 'APKG file not found'}), 404
+            return _download_error('Anki deck file not found. It may have been cleaned up - please generate again.', 404)
         return send_file(file_path, as_attachment=True, download_name=f'cards_{job_id}.apkg')
     else:
-        return jsonify({'error': 'Invalid file type'}), 400
+        return _download_error('Invalid file type requested.', 400)
 
 
 if __name__ == '__main__':
